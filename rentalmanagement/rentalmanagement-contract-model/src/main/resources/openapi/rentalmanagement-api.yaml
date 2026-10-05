@@ -1,0 +1,963 @@
+openapi: 3.1.0
+info:
+  title: Rental Management API
+  version: 0.1.0
+  description: |
+    Phase 1 (Foundation) slice of the Rental Management modular monolith:
+    identity (Keycloak-backed), properties, tenancies and tenants.
+
+    Tags map to modules (section 6 of the architecture doc):
+    Identity -> shared/security + the synced app_user snapshot,
+    Properties -> property module, Tenancies/Tenants -> tenancy module.
+
+    ## Authentication (section 13)
+    Keycloak realm `rental`.
+    - Browser: OIDC authorization code + mandatory PKCE via spring-boot-starter-oauth2-client.
+      The app keeps a server-side session (httpOnly JSESSIONID) after login; raw JWTs are
+      never exposed to page JavaScript.
+    - Programmatic clients: JWT bearer access tokens, issuer
+      https://auth.homelab.internal/realms/rental, audience `rental-api`, validated by
+      spring-boot-starter-oauth2-resource-server.
+    Both paths map realm roles from the `realm_access.roles` claim to ROLE_* authorities.
+
+    ## Roles
+    ADMIN and LANDLORD read and write. FAMILY_VIEWER and ACCOUNTANT are read-only.
+    GET /users requires ADMIN. User administration itself happens in Keycloak; app_user is a
+    just-in-time synced snapshot keyed by the `sub` claim and is read-only in this API.
+
+    ## Conventions
+    - Money is a decimal string mapped to NUMERIC(12,2) — never floating point.
+    - Errors use RFC 9457 application/problem+json.
+    - Every mutating operation writes an audit_event via the shared auditing module.
+servers:
+  - url: https://rental.homelab.internal/api
+    description: K3s Traefik ingress (private LAN / Tailscale only)
+tags:
+  - name: Identity
+  - name: Properties
+  - name: Tenancies
+  - name: Tenants
+security:
+  - keycloakOAuth: []
+  - bearerAuth: []
+paths:
+  /me:
+    get:
+      tags: [Identity]
+      summary: Current authenticated user
+      description: Returns the locally synced app_user snapshot for the caller (upserted on
+        first login from the Keycloak sub, preferred_username, name, email and roles).
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /users:
+    get:
+      tags: [Identity]
+      summary: List synced users (ADMIN only)
+      description: Read-only view of the app_user snapshot. Creating, disabling and role
+        changes happen in Keycloak; the local row is refreshed on next login.
+      operationId: listUsers
+      parameters:
+        - name: role
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: active
+          in: query
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PageOfUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /properties:
+    get:
+      tags: [Properties]
+      summary: List properties
+      operationId: listProperties
+      parameters:
+        - name: q
+          in: query
+          description: Free-text match on reference, name and address lines (pg_trgm-backed).
+          schema:
+            type: string
+        - name: propertyType
+          in: query
+          schema:
+            $ref: '#/components/schemas/PropertyType'
+        - name: active
+          in: query
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PageOfProperty'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Properties]
+      summary: Create property
+      description: Roles ADMIN, LANDLORD. propertyReference must be unique.
+      operationId: createProperty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyInput'
+      responses:
+        '201':
+          description: Created. Location header points at the new resource.
+          headers:
+            Location:
+              description: URL of the created property.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /properties/{propertyId}:
+    parameters:
+      - $ref: '#/components/parameters/PropertyId'
+    get:
+      tags: [Properties]
+      summary: Get property
+      operationId: getProperty
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Properties]
+      summary: Update property
+      description: Roles ADMIN, LANDLORD. Full update; propertyReference is immutable.
+      operationId: updateProperty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyUpdateInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Properties]
+      summary: Deactivate property
+      description: Roles ADMIN, LANDLORD. Soft delete — sets active=false and records an
+        audit event. Rejected while the property still has non-ended tenancies.
+      operationId: deleteProperty
+      responses:
+        '204':
+          description: Deactivated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /properties/{propertyId}/tenancies:
+    parameters:
+      - $ref: '#/components/parameters/PropertyId'
+    get:
+      tags: [Tenancies]
+      summary: List tenancies for a property
+      operationId: listTenanciesForProperty
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TenancyStatus'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PageOfTenancy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Tenancies]
+      summary: Create tenancy for a property
+      description: Roles ADMIN, LANDLORD. The server rejects overlapping non-ended tenancies
+        for the same property.
+      operationId: createTenancy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenancyInput'
+      responses:
+        '201':
+          description: Created. Location header points at the new tenancy.
+          headers:
+            Location:
+              description: URL of the created tenancy.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenancyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /tenancies/{tenancyId}:
+    parameters:
+      - $ref: '#/components/parameters/TenancyId'
+    get:
+      tags: [Tenancies]
+      summary: Get tenancy
+      operationId: getTenancy
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenancyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Tenancies]
+      summary: Update tenancy
+      description: Roles ADMIN, LANDLORD. Status changes are validated against the allowed
+        transitions and audited. endDate must be set when transitioning to ENDED.
+      operationId: updateTenancy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenancyInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenancyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Tenancies]
+      summary: Delete tenancy
+      description: Roles ADMIN, LANDLORD. Only possible while the tenancy is DRAFT or
+        CANCELLED; otherwise the tenancy is historical and must be ended via PUT.
+      operationId: deleteTenancy
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /tenancies/{tenancyId}/tenants:
+    parameters:
+      - $ref: '#/components/parameters/TenancyId'
+    get:
+      tags: [Tenants]
+      summary: List tenants on a tenancy
+      operationId: listTenants
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PageOfTenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Tenants]
+      summary: Add tenant to a tenancy
+      description: Roles ADMIN, LANDLORD. Rejected when the tenancy is ENDED or CANCELLED.
+      operationId: addTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantInput'
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location:
+              description: URL of the created tenant.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /tenancies/{tenancyId}/tenants/{tenantId}:
+    parameters:
+      - $ref: '#/components/parameters/TenancyId'
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [Tenants]
+      summary: Get tenant
+      operationId: getTenant
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Tenants]
+      summary: Update tenant
+      description: Roles ADMIN, LANDLORD. Set moveOutDate here when a tenant leaves rather
+        than deleting the record.
+      operationId: updateTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Tenants]
+      summary: Remove tenant
+      description: Roles ADMIN, LANDLORD. Rejected when the tenancy is ENDED or CANCELLED —
+        prefer PUT with moveOutDate to preserve history.
+      operationId: removeTenant
+      responses:
+        '204':
+          description: Removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+components:
+  securitySchemes:
+    keycloakOAuth:
+      type: oauth2
+      description: |
+        OIDC authorization code flow with mandatory PKCE (S256) against the Keycloak realm
+        `rental` (PKCE and refresh-token rotation are not expressible in OpenAPI flows — they
+        are enforced by the realm and the Spring Security client configuration).
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/auth
+          tokenUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/token
+          scopes:
+            openid: Authenticate the user (OIDC).
+            profile: Read basic profile claims.
+            email: Read email claims.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak access token with audience `rental-api`; validated as a resource server.
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: Zero-based page index.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 100
+        default: 20
+    Sort:
+      name: sort
+      in: query
+      description: "property[,asc|desc] — e.g. `createdAt,desc`."
+      schema:
+        type: string
+        default: 'createdAt,desc'
+    PropertyId:
+      name: propertyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TenancyId:
+      name: tenancyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Unauthorized:
+      description: Not authenticated.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Authenticated but the role is insufficient for this operation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationError:
+      description: Request body or parameters failed validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Business rule conflict (duplicate reference, overlapping tenancy,
+        invalid status transition, non-empty delete, etc.).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Money:
+      type: string
+      pattern: '^\d{1,10}(\.\d{2})?$'
+      description: Decimal amount as a string, persisted as NUMERIC(12,2).
+      example: '1450.00'
+    UserRole:
+      type: string
+      enum: [ADMIN, LANDLORD, FAMILY_VIEWER, ACCOUNTANT]
+    PropertyType:
+      type: string
+      enum: [TERRACED, SEMI_DETACHED, DETACHED, FLAT, MAISONETTE, BUNGALOW, HMO, OTHER]
+    TenancyStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, NOTICE, ENDED, CANCELLED]
+      description: |
+        Allowed transitions (validated server-side and audited):
+        DRAFT -> ACTIVE | CANCELLED
+        ACTIVE -> NOTICE | ENDED
+        NOTICE -> ENDED
+        ENDED and CANCELLED are terminal.
+    UserResponse:
+      type: object
+      required: [id, username, displayName, role, active, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+          maxLength: 100
+        displayName:
+          type: string
+          maxLength: 200
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        role:
+          $ref: '#/components/schemas/UserRole'
+        active:
+          type: boolean
+        idpSubject:
+          type: string
+          description: Keycloak `sub` claim; populated on first login.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    PageOfUser:
+      type: object
+      required: [content, totalElements, totalPages, page, size]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        totalElements:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+        page:
+          type: integer
+          description: Zero-based page index.
+        size:
+          type: integer
+    PropertyInput:
+      type: object
+      required: [propertyReference, addressLine1, postcode]
+      properties:
+        propertyReference:
+          type: string
+          maxLength: 50
+          example: 'PROP-001'
+        propertyName:
+          type: string
+          maxLength: 200
+        addressLine1:
+          type: string
+          maxLength: 200
+        addressLine2:
+          type: string
+          maxLength: 200
+        town:
+          type: string
+          maxLength: 100
+        county:
+          type: string
+          maxLength: 100
+        postcode:
+          type: string
+          maxLength: 12
+          example: 'SW1A 1AA'
+        propertyType:
+          $ref: '#/components/schemas/PropertyType'
+        purchaseDate:
+          type: string
+          format: date
+        purchasePrice:
+          $ref: '#/components/schemas/Money'
+        ownershipPercentage:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+          default: 100
+          description: Ownership share of this property, in percent.
+        notes:
+          type: string
+    PropertyUpdateInput:
+      type: object
+      description: Full update; propertyReference is immutable and must be omitted.
+      required: [addressLine1, postcode]
+      properties:
+        propertyName:
+          type: string
+          maxLength: 200
+        addressLine1:
+          type: string
+          maxLength: 200
+        addressLine2:
+          type: string
+          maxLength: 200
+        town:
+          type: string
+          maxLength: 100
+        county:
+          type: string
+          maxLength: 100
+        postcode:
+          type: string
+          maxLength: 12
+        propertyType:
+          $ref: '#/components/schemas/PropertyType'
+        purchaseDate:
+          type: string
+          format: date
+        purchasePrice:
+          $ref: '#/components/schemas/Money'
+        ownershipPercentage:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+        notes:
+          type: string
+    PropertyResponse:
+      type: object
+      required: [id, propertyReference, addressLine1, postcode, ownershipPercentage, active, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        propertyReference:
+          type: string
+        propertyName:
+          type: string
+        addressLine1:
+          type: string
+        addressLine2:
+          type: string
+        town:
+          type: string
+        county:
+          type: string
+        postcode:
+          type: string
+        propertyType:
+          $ref: '#/components/schemas/PropertyType'
+        purchaseDate:
+          type: string
+          format: date
+        purchasePrice:
+          $ref: '#/components/schemas/Money'
+        ownershipPercentage:
+          type: number
+        active:
+          type: boolean
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    PageOfProperty:
+      type: object
+      required: [content, totalElements, totalPages, page, size]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/PropertyResponse'
+        totalElements:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+    TenancyInput:
+      type: object
+      description: Used for create and update. On create, status may only be DRAFT (default)
+        or ACTIVE; on update, transitions are validated per TenancyStatus.
+      required: [startDate, monthlyRent]
+      properties:
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        monthlyRent:
+          $ref: '#/components/schemas/Money'
+        paymentDay:
+          type: integer
+          minimum: 1
+          maximum: 31
+          description: Day of month the rent is due.
+        depositAmount:
+          $ref: '#/components/schemas/Money'
+        depositScheme:
+          type: string
+          maxLength: 150
+          description: UK tenancy deposit protection scheme name.
+        depositReference:
+          type: string
+          maxLength: 150
+        status:
+          $ref: '#/components/schemas/TenancyStatus'
+        agreementDocumentId:
+          type: string
+          format: uuid
+          description: Reference to a TENANCY_AGREEMENT document once the document module
+            (Phase 2) is wired; null until then.
+        notes:
+          type: string
+    TenancyResponse:
+      type: object
+      required: [id, propertyId, startDate, monthlyRent, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        propertyId:
+          type: string
+          format: uuid
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        monthlyRent:
+          $ref: '#/components/schemas/Money'
+        paymentDay:
+          type: integer
+        depositAmount:
+          $ref: '#/components/schemas/Money'
+        depositScheme:
+          type: string
+        depositReference:
+          type: string
+        status:
+          $ref: '#/components/schemas/TenancyStatus'
+        agreementDocumentId:
+          type: string
+          format: uuid
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    PageOfTenancy:
+      type: object
+      required: [content, totalElements, totalPages, page, size]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/TenancyResponse'
+        totalElements:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+    TenantInput:
+      type: object
+      required: [fullName]
+      description: Basic tenant information supplied by the agency — only what management
+        and reporting require (privacy requirement, section 3).
+      properties:
+        fullName:
+          type: string
+          maxLength: 200
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        phone:
+          type: string
+          maxLength: 50
+        moveInDate:
+          type: string
+          format: date
+        moveOutDate:
+          type: string
+          format: date
+        emergencyContactName:
+          type: string
+          maxLength: 200
+        emergencyContactPhone:
+          type: string
+          maxLength: 50
+        notes:
+          type: string
+    TenantResponse:
+      type: object
+      required: [id, tenancyId, fullName, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenancyId:
+          type: string
+          format: uuid
+        fullName:
+          type: string
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+        moveInDate:
+          type: string
+          format: date
+        moveOutDate:
+          type: string
+          format: date
+        emergencyContactName:
+          type: string
+        emergencyContactPhone:
+          type: string
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    PageOfTenant:
+      type: object
+      required: [content, totalElements, totalPages, page, size]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/TenantResponse'
+        totalElements:
+          type: integer
+          format: int64
+        totalPages:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+    Problem:
+      type: object
+      description: RFC 9457 problem details, served as application/problem+json.
+      properties:
+        type:
+          type: string
+          format: uri
+          default: 'about:blank'
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        violations:
+          type: array
+          description: Present on 400 validation errors.
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
