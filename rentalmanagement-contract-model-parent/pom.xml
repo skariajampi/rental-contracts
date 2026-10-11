@@ -52,7 +52,7 @@
                                 <modelNameSuffix>DTO</modelNameSuffix>
                                 <configOptions>
                                     <interfaceOnly>true</interfaceOnly>
-                                    <useSpringBoot3>true</useSpringBoot3>
+                                    <useSpringBoot4>true</useSpringBoot4>
                                     <delegatePattern>true</delegatePattern>
                                     <java8>true</java8>
                                     <useTags>false</useTags>
