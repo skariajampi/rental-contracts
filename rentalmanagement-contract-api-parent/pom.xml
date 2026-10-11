@@ -46,6 +46,7 @@
                                     <useTags>false</useTags>
                                     <serializationLibrary>jackson</serializationLibrary>
                                     <useJakartaEe>true</useJakartaEe>
+                                    <useJackson3>true</useJackson3>
                                     <!-- Important: Set model type to pojo for Lombok compatibility -->
                                     <modelType>pojo</modelType>
 
