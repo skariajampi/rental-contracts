@@ -1,5 +1,5 @@
 # Prerequisite
-- Java 11
+- Java 25
 ---
 
 ## Version Update
