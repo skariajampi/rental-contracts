@@ -1,29 +1,39 @@
 openapi: 3.1.0
 info:
   title: Rental Management API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Phase 1 (Foundation) slice of the Rental Management modular monolith:
-    identity (Keycloak-backed), properties, tenancies and tenants.
+    identity (Keycloak-backed), properties, tenancies, and tenants.
 
-    Tags map to modules (section 6 of the architecture doc):
-    Identity -> shared/security + the synced app_user snapshot,
-    Properties -> property module, Tenancies/Tenants -> tenancy module.
+    ## Authentication & Session Semantics (A)
+    - **Browser UI**: Authenticates via OIDC authorization code flow + PKCE (S256).
+      Upon successful authentication, Spring Security establishes a secure server-side session (`JSESSIONID`).
+      Session cookies must be `HttpOnly`, `SameSite=Lax`, and `Secure`.
+      Browser requests navigating to HTML views redirect to Keycloak if unauthenticated.
+      Browser API/XHR/fetch requests returning 401 receive an RFC 9457 `application/problem+json` response (never an HTML redirect).
+      Mutating operations authenticated via cookie require a valid CSRF token (`X-XSRF-TOKEN`).
+    - **Programmatic Clients**: Bearer JWT tokens passed in the `Authorization: Bearer <token>` header,
+      validated statelessly as an OAuth2 Resource Server. CSRF validation is disabled for Bearer requests.
 
-    ## Authentication (section 13)
-    Keycloak realm `rental`.
-    - Browser: OIDC authorization code + mandatory PKCE via spring-boot-starter-oauth2-client.
-      The app keeps a server-side session (httpOnly JSESSIONID) after login; raw JWTs are
-      never exposed to page JavaScript.
-    - Programmatic clients: JWT bearer access tokens, issuer
-      https://auth.homelab.internal/realms/rental, audience `rental-api`, validated by
-      spring-boot-starter-oauth2-resource-server.
-    Both paths map realm roles from the `realm_access.roles` claim to ROLE_* authorities.
+    ## Roles & Identity (B)
+    - Roles: `ADMIN`, `LANDLORD`, `FAMILY_VIEWER`, `ACCOUNTANT`.
+    - Each user has exactly **one** primary application role, resolved from `realm_access.roles` by priority:
+      `ADMIN` > `LANDLORD` > `ACCOUNTANT` > `FAMILY_VIEWER`.
+    - Durable external identity is anchored on `(idpIssuer, idpSubject)` in persistence. These values are not exposed in the API.
 
-    ## Roles
-    ADMIN and LANDLORD read and write. FAMILY_VIEWER and ACCOUNTANT are read-only.
-    GET /users requires ADMIN. User administration itself happens in Keycloak; app_user is a
-    just-in-time synced snapshot keyed by the `sub` claim and is read-only in this API.
+    ## Tenancy Overlap Business Rule (E)
+    - Each `Property` record represents an **independent single letting unit**.
+    - For HMO properties in Phase 1, the property represents the entire dwelling let under a single agreement.
+    - No two non-ended tenancies (DRAFT, ACTIVE, NOTICE) of the same property may have overlapping date ranges. An open-ended tenancy (null endDate) is treated as running indefinitely.
+    - Concurrency protection on tenancy overlap must be enforced at the database level (PostgreSQL GiST exclusion constraint on `daterange`).
+    - CHECK (end_date IS NULL OR end_date >= start_date) in the migration. State in the endDate descriptions that endDate must be on or after startDate.
+
+    ## Mutation & Concurrency Conventions (C & D)
+    - `PUT` requests represent a **full replacement** of mutable fields.
+      Omitted optional fields or explicit `null` values clear the existing stored value.
+    - Updates and deletes require optimistic locking via a `version` field.
+      Concurrent edits returning mismatched versions result in an RFC 9457 `409 Conflict`.
 
     ## Conventions
     - Money is a decimal string mapped to NUMERIC(12,2) — never floating point.
@@ -38,12 +48,13 @@ tags:
   - name: Tenancies
   - name: Tenants
 security:
-  - keycloakOAuth: []
-  - bearerAuth: []
+  - keycloakOAuth: [ ]
+  - bearerAuth: [ ]
+  - sessionCookieAuth: [ ]
 paths:
   /me:
     get:
-      tags: [Identity]
+      tags: [ Identity ]
       summary: Current authenticated user
       description: Returns the locally synced app_user snapshot for the caller (upserted on
         first login from the Keycloak sub, preferred_username, name, email and roles).
@@ -59,7 +70,7 @@ paths:
           $ref: '#/components/responses/Unauthorized'
   /users:
     get:
-      tags: [Identity]
+      tags: [ Identity ]
       summary: List synced users (ADMIN only)
       description: Read-only view of the app_user snapshot. Creating, disabling and role
         changes happen in Keycloak; the local row is refreshed on next login.
@@ -75,7 +86,7 @@ paths:
             type: boolean
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/Size'
-        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/UserSort'
       responses:
         '200':
           description: OK
@@ -87,9 +98,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
   /properties:
     get:
-      tags: [Properties]
+      tags: [ Properties ]
       summary: List properties
       operationId: listProperties
       parameters:
@@ -108,7 +122,7 @@ paths:
             type: boolean
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/Size'
-        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/PropertySort'
       responses:
         '200':
           description: OK
@@ -118,8 +132,10 @@ paths:
                 $ref: '#/components/schemas/PageOfProperty'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/ValidationError'
     post:
-      tags: [Properties]
+      tags: [ Properties ]
       summary: Create property
       description: Roles ADMIN, LANDLORD. propertyReference must be unique.
       operationId: createProperty
@@ -154,7 +170,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/PropertyId'
     get:
-      tags: [Properties]
+      tags: [ Properties ]
       summary: Get property
       operationId: getProperty
       responses:
@@ -169,7 +185,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
     put:
-      tags: [Properties]
+      tags: [ Properties ]
       summary: Update property
       description: Roles ADMIN, LANDLORD. Full update; propertyReference is immutable.
       operationId: updateProperty
@@ -194,12 +210,16 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
     delete:
-      tags: [Properties]
+      tags: [ Properties ]
       summary: Deactivate property
       description: Roles ADMIN, LANDLORD. Soft delete — sets active=false and records an
         audit event. Rejected while the property still has non-ended tenancies.
       operationId: deleteProperty
+      parameters:
+        - $ref: '#/components/parameters/VersionQueryParam'
       responses:
         '204':
           description: Deactivated.
@@ -211,11 +231,14 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
   /properties/{propertyId}/tenancies:
     parameters:
       - $ref: '#/components/parameters/PropertyId'
     get:
-      tags: [Tenancies]
+      tags: [ Tenancies ]
       summary: List tenancies for a property
       operationId: listTenanciesForProperty
       parameters:
@@ -225,7 +248,7 @@ paths:
             $ref: '#/components/schemas/TenancyStatus'
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/Size'
-        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/TenancySort'
       responses:
         '200':
           description: OK
@@ -237,8 +260,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/ValidationError'
     post:
-      tags: [Tenancies]
+      tags: [ Tenancies ]
       summary: Create tenancy for a property
       description: Roles ADMIN, LANDLORD. The server rejects overlapping non-ended tenancies
         for the same property.
@@ -276,7 +301,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/TenancyId'
     get:
-      tags: [Tenancies]
+      tags: [ Tenancies ]
       summary: Get tenancy
       operationId: getTenancy
       responses:
@@ -291,7 +316,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
     put:
-      tags: [Tenancies]
+      tags: [ Tenancies ]
       summary: Update tenancy
       description: Roles ADMIN, LANDLORD. Status changes are validated against the allowed
         transitions and audited. endDate must be set when transitioning to ENDED.
@@ -301,7 +326,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TenancyInput'
+              $ref: '#/components/schemas/TenancyUpdateInput'
       responses:
         '200':
           description: OK
@@ -320,11 +345,13 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
     delete:
-      tags: [Tenancies]
+      tags: [ Tenancies ]
       summary: Delete tenancy
       description: Roles ADMIN, LANDLORD. Only possible while the tenancy is DRAFT or
         CANCELLED; otherwise the tenancy is historical and must be ended via PUT.
       operationId: deleteTenancy
+      parameters:
+        - $ref: '#/components/parameters/VersionQueryParam'
       responses:
         '204':
           description: Deleted.
@@ -336,17 +363,20 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
   /tenancies/{tenancyId}/tenants:
     parameters:
       - $ref: '#/components/parameters/TenancyId'
     get:
-      tags: [Tenants]
+      tags: [ Tenants ]
       summary: List tenants on a tenancy
       operationId: listTenants
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/Size'
-        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/TenantSort'
       responses:
         '200':
           description: OK
@@ -358,8 +388,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/ValidationError'
     post:
-      tags: [Tenants]
+      tags: [ Tenants ]
       summary: Add tenant to a tenancy
       description: Roles ADMIN, LANDLORD. Rejected when the tenancy is ENDED or CANCELLED.
       operationId: addTenant
@@ -397,7 +429,7 @@ paths:
       - $ref: '#/components/parameters/TenancyId'
       - $ref: '#/components/parameters/TenantId'
     get:
-      tags: [Tenants]
+      tags: [ Tenants ]
       summary: Get tenant
       operationId: getTenant
       responses:
@@ -412,7 +444,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
     put:
-      tags: [Tenants]
+      tags: [ Tenants ]
       summary: Update tenant
       description: Roles ADMIN, LANDLORD. Set moveOutDate here when a tenant leaves rather
         than deleting the record.
@@ -422,7 +454,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TenantInput'
+              $ref: '#/components/schemas/TenantUpdateInput'
       responses:
         '200':
           description: OK
@@ -438,12 +470,16 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+           $ref: '#/components/responses/Conflict'
     delete:
-      tags: [Tenants]
+      tags: [ Tenants ]
       summary: Remove tenant
       description: Roles ADMIN, LANDLORD. Rejected when the tenancy is ENDED or CANCELLED —
         prefer PUT with moveOutDate to preserve history.
       operationId: removeTenant
+      parameters:
+        - $ref: '#/components/parameters/VersionQueryParam'
       responses:
         '204':
           description: Removed.
@@ -455,27 +491,34 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
 components:
   securitySchemes:
+    sessionCookieAuth:
+      type: apiKey
+      in: cookie
+      name: JSESSIONID
+      description: |
+        Browser session cookie established post-OIDC authentication.
+        Mutating requests require CSRF token passed via `X-XSRF-TOKEN` header.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak JWT access token with audience `rental-api`.
     keycloakOAuth:
       type: oauth2
-      description: |
-        OIDC authorization code flow with mandatory PKCE (S256) against the Keycloak realm
-        `rental` (PKCE and refresh-token rotation are not expressible in OpenAPI flows — they
-        are enforced by the realm and the Spring Security client configuration).
+      description: OIDC authorization code flow with mandatory PKCE (S256).
       flows:
         authorizationCode:
           authorizationUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/auth
           tokenUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/token
           scopes:
-            openid: Authenticate the user (OIDC).
-            profile: Read basic profile claims.
-            email: Read email claims.
-    bearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
-      description: Keycloak access token with audience `rental-api`; validated as a resource server.
+            openid: Authenticate user
+            profile: User profile claims
+            email: Email claims
   parameters:
     Page:
       name: page
@@ -489,19 +532,80 @@ components:
     Size:
       name: size
       in: query
+      description: Number of records per page.
       schema:
         type: integer
         format: int32
         minimum: 1
         maximum: 100
         default: 20
-    Sort:
+    VersionQueryParam:
+      name: version
+      in: query
+      required: true
+      description: Expected resource version for safe optimistic-locked deletion.
+      schema:
+        $ref: '#/components/schemas/ResourceVersion'
+    PropertySort:
       name: sort
       in: query
-      description: "property[,asc|desc] — e.g. `createdAt,desc`."
+      description: Single sort field. Tie-breaker `id,asc` is always applied server-side.
       schema:
         type: string
         default: 'createdAt,desc'
+        enum:
+          - 'propertyReference,asc'
+          - 'propertyReference,desc'
+          - 'propertyName,asc'
+          - 'propertyName,desc'
+          - 'createdAt,asc'
+          - 'createdAt,desc'
+          - 'updatedAt,asc'
+          - 'updatedAt,desc'
+    TenancySort:
+      name: sort
+      in: query
+      description: Single sort field. Tie-breaker `id,asc` is always applied server-side.
+      schema:
+        type: string
+        default: 'startDate,desc'
+        enum:
+          - 'startDate,asc'
+          - 'startDate,desc'
+          - 'endDate,asc'
+          - 'endDate,desc'
+          - 'monthlyRent,asc'
+          - 'monthlyRent,desc'
+          - 'createdAt,asc'
+          - 'createdAt,desc'
+    TenantSort:
+      name: sort
+      in: query
+      description: Single sort field. Tie-breaker `id,asc` is always applied server-side.
+      schema:
+        type: string
+        default: 'createdAt,desc'
+        enum:
+          - 'fullName,asc'
+          - 'fullName,desc'
+          - 'moveInDate,asc'
+          - 'moveInDate,desc'
+          - 'createdAt,asc'
+          - 'createdAt,desc'
+    UserSort:
+      name: sort
+      in: query
+      description: Single sort field. Tie-breaker `id,asc` is always applied server-side.
+      schema:
+        type: string
+        default: 'createdAt,desc'
+        enum:
+          - 'username,asc'
+          - 'username,desc'
+          - 'displayName,asc'
+          - 'displayName,desc'
+          - 'createdAt,asc'
+          - 'createdAt,desc'
     PropertyId:
       name: propertyId
       in: path
@@ -531,7 +635,7 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Forbidden:
-      description: Authenticated but the role is insufficient for this operation.
+      description: Role insufficient for this operation, or CSRF token missing/invalid on a cookie-authenticated mutation.
       content:
         application/problem+json:
           schema:
@@ -549,27 +653,42 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Conflict:
-      description: Business rule conflict (duplicate reference, overlapping tenancy,
-        invalid status transition, non-empty delete, etc.).
+      description: |
+        Business-rule conflict (duplicate reference, overlapping tenancy, invalid status
+        transition, non-empty delete) or stale `version` (optimistic-lock failure).
+        Clients distinguish cases via `Problem.type`.
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
   schemas:
+    ResourceVersion:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Optimistic lock version counter. Incremented on every mutation.
+      example: 1
+
     Money:
       type: string
       pattern: '^\d{1,10}(\.\d{2})?$'
       description: Decimal amount as a string, persisted as NUMERIC(12,2).
       example: '1450.00'
+
+    NullableMoney:
+      description: Decimal monetary amount or explicit null.
+      anyOf:
+        - $ref: '#/components/schemas/Money'
+        - type: 'null'
     UserRole:
       type: string
-      enum: [ADMIN, LANDLORD, FAMILY_VIEWER, ACCOUNTANT]
+      enum: [ ADMIN, LANDLORD, FAMILY_VIEWER, ACCOUNTANT ]
     PropertyType:
       type: string
-      enum: [TERRACED, SEMI_DETACHED, DETACHED, FLAT, MAISONETTE, BUNGALOW, HMO, OTHER]
+      enum: [ TERRACED, SEMI_DETACHED, DETACHED, FLAT, MAISONETTE, BUNGALOW, HMO, OTHER ]
     TenancyStatus:
       type: string
-      enum: [DRAFT, ACTIVE, NOTICE, ENDED, CANCELLED]
+      enum: [ DRAFT, ACTIVE, NOTICE, ENDED, CANCELLED ]
       description: |
         Allowed transitions (validated server-side and audited):
         DRAFT -> ACTIVE | CANCELLED
@@ -578,7 +697,7 @@ components:
         ENDED and CANCELLED are terminal.
     UserResponse:
       type: object
-      required: [id, username, displayName, role, active, createdAt, updatedAt]
+      required: [ id, username, displayName, role, active, createdAt, updatedAt ]
       properties:
         id:
           type: string
@@ -590,16 +709,13 @@ components:
           type: string
           maxLength: 200
         email:
-          type: string
+          type: [ string, 'null' ]
           format: email
           maxLength: 320
         role:
           $ref: '#/components/schemas/UserRole'
         active:
           type: boolean
-        idpSubject:
-          type: string
-          description: Keycloak `sub` claim; populated on first login.
         createdAt:
           type: string
           format: date-time
@@ -608,7 +724,7 @@ components:
           format: date-time
     PageOfUser:
       type: object
-      required: [content, totalElements, totalPages, page, size]
+      required: [ content, totalElements, totalPages, page, size ]
       properties:
         content:
           type: array
@@ -626,125 +742,140 @@ components:
           type: integer
     PropertyInput:
       type: object
-      required: [propertyReference, addressLine1, postcode]
+      additionalProperties: false
+      required: [ propertyReference, addressLine1, postcode ]
       properties:
         propertyReference:
           type: string
           maxLength: 50
           example: 'PROP-001'
         propertyName:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 200
         addressLine1:
           type: string
           maxLength: 200
         addressLine2:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 200
         town:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 100
         county:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 100
         postcode:
           type: string
           maxLength: 12
           example: 'SW1A 1AA'
         propertyType:
-          $ref: '#/components/schemas/PropertyType'
+          anyOf:
+            - $ref: '#/components/schemas/PropertyType'
+            - type: 'null'
         purchaseDate:
-          type: string
+          type: [ string, 'null' ]
           format: date
         purchasePrice:
-          $ref: '#/components/schemas/Money'
+          $ref: '#/components/schemas/NullableMoney'
         ownershipPercentage:
           type: number
           exclusiveMinimum: 0
           maximum: 100
           default: 100
-          description: Ownership share of this property, in percent.
         notes:
-          type: string
+          type: [ string, 'null' ]
+
     PropertyUpdateInput:
-      type: object
-      description: Full update; propertyReference is immutable and must be omitted.
-      required: [addressLine1, postcode]
-      properties:
-        propertyName:
-          type: string
-          maxLength: 200
-        addressLine1:
-          type: string
-          maxLength: 200
-        addressLine2:
-          type: string
-          maxLength: 200
-        town:
-          type: string
-          maxLength: 100
-        county:
-          type: string
-          maxLength: 100
-        postcode:
-          type: string
-          maxLength: 12
-        propertyType:
-          $ref: '#/components/schemas/PropertyType'
-        purchaseDate:
-          type: string
-          format: date
-        purchasePrice:
-          $ref: '#/components/schemas/Money'
-        ownershipPercentage:
-          type: number
-          exclusiveMinimum: 0
-          maximum: 100
-        notes:
-          type: string
+        type: object
+        additionalProperties: false
+        description: |
+          Full update. Required fields must not be null.
+          Omission or explicit null for optional fields clears their stored value.
+        required: [ addressLine1, postcode, ownershipPercentage, version ]
+        properties:
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          propertyName:
+            type: [ string, 'null' ]
+            maxLength: 200
+          addressLine1:
+            type: string
+            maxLength: 200
+          addressLine2:
+            type: [ string, 'null' ]
+            maxLength: 200
+          town:
+            type: [ string, 'null' ]
+            maxLength: 100
+          county:
+            type: [ string, 'null' ]
+            maxLength: 100
+          postcode:
+            type: string
+            maxLength: 12
+          propertyType:
+            anyOf:
+              - $ref: '#/components/schemas/PropertyType'
+              - type: 'null'
+          purchaseDate:
+            type: [ string, 'null' ]
+            format: date
+          purchasePrice:
+            $ref: '#/components/schemas/NullableMoney'
+          ownershipPercentage:
+            type: number
+            exclusiveMinimum: 0
+            maximum: 100
+          notes:
+            type: [ string, 'null' ]
+
     PropertyResponse:
-      type: object
-      required: [id, propertyReference, addressLine1, postcode, ownershipPercentage, active, createdAt, updatedAt]
-      properties:
-        id:
-          type: string
-          format: uuid
-        propertyReference:
-          type: string
-        propertyName:
-          type: string
-        addressLine1:
-          type: string
-        addressLine2:
-          type: string
-        town:
-          type: string
-        county:
-          type: string
-        postcode:
-          type: string
-        propertyType:
-          $ref: '#/components/schemas/PropertyType'
-        purchaseDate:
-          type: string
-          format: date
-        purchasePrice:
-          $ref: '#/components/schemas/Money'
-        ownershipPercentage:
-          type: number
-        active:
-          type: boolean
-        notes:
-          type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
+        type: object
+        required: [ id, propertyReference, addressLine1, postcode, ownershipPercentage, active, version, createdAt, updatedAt ]
+        properties:
+          id:
+            type: string
+            format: uuid
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          propertyReference:
+            type: string
+          propertyName:
+            type: [ string, 'null' ]
+          addressLine1:
+            type: string
+          addressLine2:
+            type: [ string, 'null' ]
+          town:
+            type: [ string, 'null' ]
+          county:
+            type: [ string, 'null' ]
+          postcode:
+            type: string
+          propertyType:
+            anyOf:
+              - $ref: '#/components/schemas/PropertyType'
+              - type: 'null'
+          purchaseDate:
+            type: [ string, 'null' ]
+            format: date
+          purchasePrice:
+            $ref: '#/components/schemas/NullableMoney'
+          ownershipPercentage:
+            type: number
+          active:
+            type: boolean
+          notes:
+            type: [ string, 'null' ]
+          createdAt:
+            type: string
+            format: date-time
+          updatedAt:
+            type: string
+            format: date-time
     PageOfProperty:
       type: object
-      required: [content, totalElements, totalPages, page, size]
+      required: [ content, totalElements, totalPages, page, size ]
       properties:
         content:
           type: array
@@ -761,83 +892,122 @@ components:
           type: integer
     TenancyInput:
       type: object
-      description: Used for create and update. On create, status may only be DRAFT (default)
-        or ACTIVE; on update, transitions are validated per TenancyStatus.
-      required: [startDate, monthlyRent]
+      additionalProperties: false
+      required: [ startDate, monthlyRent ]
       properties:
         startDate:
           type: string
           format: date
         endDate:
-          type: string
+          type: [ string, 'null' ]
           format: date
+          description: Must be on or after startDate. Null means open-ended.
         monthlyRent:
           $ref: '#/components/schemas/Money'
         paymentDay:
-          type: integer
+          type: [ integer, 'null' ]
           minimum: 1
           maximum: 31
-          description: Day of month the rent is due.
         depositAmount:
-          $ref: '#/components/schemas/Money'
+          $ref: '#/components/schemas/NullableMoney'
         depositScheme:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 150
-          description: UK tenancy deposit protection scheme name.
         depositReference:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 150
         status:
           $ref: '#/components/schemas/TenancyStatus'
+          default: DRAFT
         agreementDocumentId:
-          type: string
+          type: [ string, 'null' ]
           format: uuid
-          description: Reference to a TENANCY_AGREEMENT document once the document module
-            (Phase 2) is wired; null until then.
         notes:
-          type: string
+          type: [ string, 'null' ]
+
+    TenancyUpdateInput:
+        type: object
+        additionalProperties: false
+        description: |
+          Full update. Required fields must not be null.
+          Omission or explicit null for optional fields clears their stored value.
+          Status transitions are strictly validated.
+        required: [ startDate, monthlyRent, status, version ]
+        properties:
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          startDate:
+            type: string
+            format: date
+          endDate:
+            type: [ string, 'null' ]
+            format: date
+          monthlyRent:
+            $ref: '#/components/schemas/Money'
+          paymentDay:
+            type: [ integer, 'null' ]
+            minimum: 1
+            maximum: 31
+          depositAmount:
+            $ref: '#/components/schemas/NullableMoney'
+          depositScheme:
+            type: [ string, 'null' ]
+            maxLength: 150
+          depositReference:
+            type: [ string, 'null' ]
+            maxLength: 150
+          status:
+            $ref: '#/components/schemas/TenancyStatus'
+          agreementDocumentId:
+            type: [ string, 'null' ]
+            format: uuid
+          notes:
+            type: [ string, 'null' ]
+
     TenancyResponse:
-      type: object
-      required: [id, propertyId, startDate, monthlyRent, status, createdAt, updatedAt]
-      properties:
-        id:
-          type: string
-          format: uuid
-        propertyId:
-          type: string
-          format: uuid
-        startDate:
-          type: string
-          format: date
-        endDate:
-          type: string
-          format: date
-        monthlyRent:
-          $ref: '#/components/schemas/Money'
-        paymentDay:
-          type: integer
-        depositAmount:
-          $ref: '#/components/schemas/Money'
-        depositScheme:
-          type: string
-        depositReference:
-          type: string
-        status:
-          $ref: '#/components/schemas/TenancyStatus'
-        agreementDocumentId:
-          type: string
-          format: uuid
-        notes:
-          type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
+        type: object
+        required: [ id, propertyId, startDate, monthlyRent, status, version, createdAt, updatedAt ]
+        properties:
+          id:
+            type: string
+            format: uuid
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          propertyId:
+            type: string
+            format: uuid
+          startDate:
+            type: string
+            format: date
+          endDate:
+            type: [ string, 'null' ]
+            format: date
+          monthlyRent:
+            $ref: '#/components/schemas/Money'
+          paymentDay:
+            type: [ integer, 'null' ]
+          depositAmount:
+            $ref: '#/components/schemas/NullableMoney'
+          depositScheme:
+            type: [ string, 'null' ]
+          depositReference:
+            type: [ string, 'null' ]
+          status:
+            $ref: '#/components/schemas/TenancyStatus'
+          agreementDocumentId:
+            type: [ string, 'null' ]
+            format: uuid
+          notes:
+            type: [ string, 'null' ]
+          createdAt:
+            type: string
+            format: date-time
+          updatedAt:
+            type: string
+            format: date-time
     PageOfTenancy:
       type: object
-      required: [content, totalElements, totalPages, page, size]
+      required: [ content, totalElements, totalPages, page, size ]
       properties:
         content:
           type: array
@@ -854,72 +1024,109 @@ components:
           type: integer
     TenantInput:
       type: object
-      required: [fullName]
-      description: Basic tenant information supplied by the agency — only what management
-        and reporting require (privacy requirement, section 3).
+      additionalProperties: false
+      required: [ fullName ]
       properties:
         fullName:
           type: string
           maxLength: 200
         email:
-          type: string
+          type: [ string, 'null' ]
           format: email
           maxLength: 320
         phone:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 50
         moveInDate:
-          type: string
+          type: [ string, 'null' ]
           format: date
         moveOutDate:
-          type: string
+          type: [ string, 'null' ]
           format: date
         emergencyContactName:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 200
         emergencyContactPhone:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 50
         notes:
-          type: string
+          type: [ string, 'null' ]
+
+    TenantUpdateInput:
+        type: object
+        additionalProperties: false
+        description: |
+          Full update. Required fields must not be null.
+          Omission or explicit null for optional fields clears their stored value.
+        required: [ fullName, version ]
+        properties:
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          fullName:
+            type: string
+            maxLength: 200
+          email:
+            type: [ string, 'null' ]
+            format: email
+            maxLength: 320
+          phone:
+            type: [ string, 'null' ]
+            maxLength: 50
+          moveInDate:
+            type: [ string, 'null' ]
+            format: date
+          moveOutDate:
+            type: [ string, 'null' ]
+            format: date
+          emergencyContactName:
+            type: [ string, 'null' ]
+            maxLength: 200
+          emergencyContactPhone:
+            type: [ string, 'null' ]
+            maxLength: 50
+          notes:
+            type: [ string, 'null' ]
+
     TenantResponse:
-      type: object
-      required: [id, tenancyId, fullName, createdAt, updatedAt]
-      properties:
-        id:
-          type: string
-          format: uuid
-        tenancyId:
-          type: string
-          format: uuid
-        fullName:
-          type: string
-        email:
-          type: string
-          format: email
-        phone:
-          type: string
-        moveInDate:
-          type: string
-          format: date
-        moveOutDate:
-          type: string
-          format: date
-        emergencyContactName:
-          type: string
-        emergencyContactPhone:
-          type: string
-        notes:
-          type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
+        type: object
+        required: [ id, tenancyId, fullName, version, createdAt, updatedAt ]
+        properties:
+          id:
+            type: string
+            format: uuid
+          version:
+            $ref: '#/components/schemas/ResourceVersion'
+          tenancyId:
+            type: string
+            format: uuid
+          fullName:
+            type: string
+          email:
+            type: [ string, 'null' ]
+            format: email
+          phone:
+            type: [ string, 'null' ]
+          moveInDate:
+            type: [ string, 'null' ]
+            format: date
+          moveOutDate:
+            type: [ string, 'null' ]
+            format: date
+          emergencyContactName:
+            type: [ string, 'null' ]
+          emergencyContactPhone:
+            type: [ string, 'null' ]
+          notes:
+            type: [ string, 'null' ]
+          createdAt:
+            type: string
+            format: date-time
+          updatedAt:
+            type: string
+            format: date-time
     PageOfTenant:
       type: object
-      required: [content, totalElements, totalPages, page, size]
+      required: [ content, totalElements, totalPages, page, size ]
       properties:
         content:
           type: array
@@ -936,7 +1143,12 @@ components:
           type: integer
     Problem:
       type: object
-      description: RFC 9457 problem details, served as application/problem+json.
+      description: |
+        RFC 9457 problem details, served as application/problem+json.
+        Stable identifiers include:
+        urn:rental:problem:stale-version, urn:rental:problem:tenancy-overlap,
+        urn:rental:problem:duplicate-reference, urn:rental:problem:invalid-transition,
+        urn:rental:problem:validation.
       properties:
         type:
           type: string
