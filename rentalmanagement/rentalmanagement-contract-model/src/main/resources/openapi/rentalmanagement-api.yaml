@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Rental Management API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     Phase 1 (Foundation) slice of the Rental Management modular monolith:
     identity (Keycloak-backed), properties, tenancies, and tenants.
