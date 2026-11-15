@@ -7,20 +7,27 @@ info:
     identity (Keycloak-backed), properties, tenancies, and tenants.
 
     ## Authentication & Session Semantics (A)
-    - **Browser UI**: Authenticates via OIDC authorization code flow + PKCE (S256).
+    - **Browser UI**: The Spring Boot server performs the OIDC authorization code flow + PKCE (S256)
+      with Keycloak (server-side login, BFF pattern). Tokens stay on the server.
       Upon successful authentication, Spring Security establishes a secure server-side session (`JSESSIONID`).
       Session cookies must be `HttpOnly`, `SameSite=Lax`, and `Secure`.
-      Browser requests navigating to HTML views redirect to Keycloak if unauthenticated.
-      Browser API/XHR/fetch requests returning 401 receive an RFC 9457 `application/problem+json` response (never an HTML redirect).
-      Mutating operations authenticated via cookie require a valid CSRF token (`X-XSRF-TOKEN`).
-    - **Programmatic Clients**: Bearer JWT tokens passed in the `Authorization: Bearer <token>` header,
-      validated statelessly as an OAuth2 Resource Server. CSRF validation is disabled for Bearer requests.
+    - Login is a browser redirect to `/oauth2/authorization/keycloak`, and logout is `POST /logout`
+      with the CSRF header. Neither is an API operation, so neither is described as a path here.
+    - Browser API/XHR/fetch requests returning 401 receive an RFC 9457 `application/problem+json` response (never an HTML redirect).
+      The UI then sends the browser to the login URL.
+    - Mutating operations require a valid CSRF token: the value of the `XSRF-TOKEN` cookie
+      sent in the `X-XSRF-TOKEN` header.
+    - The UI and API share one origin, so no CORS configuration is needed.
 
     ## Roles & Identity (B)
-    - Roles: `ADMIN`, `LANDLORD`, `FAMILY_VIEWER`, `ACCOUNTANT`.
-    - Each user has exactly **one** primary application role, resolved from `realm_access.roles` by priority:
-      `ADMIN` > `LANDLORD` > `ACCOUNTANT` > `FAMILY_VIEWER`.
-    - Durable external identity is anchored on `(idpIssuer, idpSubject)` in persistence. These values are not exposed in the API.
+    - Keycloak owns authentication, users and roles. Roles are `ADMIN`, `LANDLORD`, `FAMILY_VIEWER`,
+      taken from token claims and never stored in the database.
+    - Hierarchy: `ADMIN` > `LANDLORD` > `FAMILY_VIEWER`. A higher role has all permissions of the lower ones.
+    - The `role` returned by `/me` is the highest role the user holds.
+    - An authenticated user holding none of these roles receives `403` on every operation.
+    - The local `app_user` row is a identity anchor only. It is created just in time on the
+      first authenticated request, keyed on `(idpIssuer, idpSubject)`. These values are not exposed in the API.
+      `displayName` and `email` are snapshots of the token claims.
 
     ## Tenancy Overlap Business Rule (E)
     - Each `Property` record represents an **independent single letting unit**.
@@ -48,16 +55,15 @@ tags:
   - name: Tenancies
   - name: Tenants
 security:
-  - keycloakOAuth: [ ]
-  - bearerAuth: [ ]
   - sessionCookieAuth: [ ]
 paths:
   /me:
     get:
       tags: [ Identity ]
       summary: Current authenticated user
-      description: Returns the locally synced app_user snapshot for the caller (upserted on
-        first login from the Keycloak sub, preferred_username, name, email and roles).
+      description: Returns the local identity for the caller. The app_user row is created
+        on the first authenticated request and reused afterwards. displayName and email are
+        snapshots of the token claims; role is resolved from the token, not stored.
       operationId: getCurrentUser
       responses:
         '200':
@@ -68,38 +74,8 @@ paths:
                 $ref: '#/components/schemas/UserResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
-  /users:
-    get:
-      tags: [ Identity ]
-      summary: List synced users (ADMIN only)
-      description: Read-only view of the app_user snapshot. Creating, disabling and role
-        changes happen in Keycloak; the local row is refreshed on next login.
-      operationId: listUsers
-      parameters:
-        - name: role
-          in: query
-          schema:
-            $ref: '#/components/schemas/UserRole'
-        - name: active
-          in: query
-          schema:
-            type: boolean
-        - $ref: '#/components/parameters/Page'
-        - $ref: '#/components/parameters/Size'
-        - $ref: '#/components/parameters/UserSort'
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PageOfUser'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '400':
-          $ref: '#/components/responses/ValidationError'
 
   /properties:
     get:
@@ -471,7 +447,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-           $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/Conflict'
     delete:
       tags: [ Tenants ]
       summary: Remove tenant
@@ -501,24 +477,8 @@ components:
       in: cookie
       name: JSESSIONID
       description: |
-        Browser session cookie established post-OIDC authentication.
-        Mutating requests require CSRF token passed via `X-XSRF-TOKEN` header.
-    bearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
-      description: Keycloak JWT access token with audience `rental-api`.
-    keycloakOAuth:
-      type: oauth2
-      description: OIDC authorization code flow with mandatory PKCE (S256).
-      flows:
-        authorizationCode:
-          authorizationUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/auth
-          tokenUrl: https://auth.homelab.internal/realms/rental/protocol/openid-connect/token
-          scopes:
-            openid: Authenticate user
-            profile: User profile claims
-            email: Email claims
+        Server-side session cookie established after OIDC login with Keycloak.
+        Mutating requests require the CSRF token (cookie `XSRF-TOKEN`) passed via the `X-XSRF-TOKEN` header.
   parameters:
     Page:
       name: page
@@ -592,20 +552,6 @@ components:
           - 'moveInDate,desc'
           - 'createdAt,asc'
           - 'createdAt,desc'
-    UserSort:
-      name: sort
-      in: query
-      description: Single sort field. Tie-breaker `id,asc` is always applied server-side.
-      schema:
-        type: string
-        default: 'createdAt,desc'
-        enum:
-          - 'username,asc'
-          - 'username,desc'
-          - 'displayName,asc'
-          - 'displayName,desc'
-          - 'createdAt,asc'
-          - 'createdAt,desc'
     PropertyId:
       name: propertyId
       in: path
@@ -629,13 +575,13 @@ components:
         format: uuid
   responses:
     Unauthorized:
-      description: Not authenticated.
+      description: Not authenticated. The client should send the browser to the login URL.
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
     Forbidden:
-      description: Role insufficient for this operation, or CSRF token missing/invalid on a cookie-authenticated mutation.
+      description: Authenticated but holding no application role, or role insufficient for this operation, or CSRF token missing/invalid on a mutation.
       content:
         application/problem+json:
           schema:
@@ -682,7 +628,7 @@ components:
         - type: 'null'
     UserRole:
       type: string
-      enum: [ ADMIN, LANDLORD, FAMILY_VIEWER, ACCOUNTANT ]
+      enum: [ ADMIN, LANDLORD, FAMILY_VIEWER ]
     PropertyType:
       type: string
       enum: [ TERRACED, SEMI_DETACHED, DETACHED, FLAT, MAISONETTE, BUNGALOW, HMO, OTHER ]
@@ -697,49 +643,23 @@ components:
         ENDED and CANCELLED are terminal.
     UserResponse:
       type: object
-      required: [ id, username, displayName, role, active, createdAt, updatedAt ]
+      required: [ id, role ]
       properties:
         id:
           type: string
           format: uuid
-        username:
-          type: string
-          maxLength: 100
+          description: Local app_user identifier.
         displayName:
-          type: string
+          type: [ string, 'null' ]
           maxLength: 200
+          description: Snapshot of the token name claim.
         email:
           type: [ string, 'null' ]
           format: email
           maxLength: 320
+          description: Snapshot of the token email claim.
         role:
           $ref: '#/components/schemas/UserRole'
-        active:
-          type: boolean
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-    PageOfUser:
-      type: object
-      required: [ content, totalElements, totalPages, page, size ]
-      properties:
-        content:
-          type: array
-          items:
-            $ref: '#/components/schemas/UserResponse'
-        totalElements:
-          type: integer
-          format: int64
-        totalPages:
-          type: integer
-        page:
-          type: integer
-          description: Zero-based page index.
-        size:
-          type: integer
     PropertyInput:
       type: object
       additionalProperties: false
@@ -786,93 +706,93 @@ components:
           type: [ string, 'null' ]
 
     PropertyUpdateInput:
-        type: object
-        additionalProperties: false
-        description: |
-          Full update. Required fields must not be null.
-          Omission or explicit null for optional fields clears their stored value.
-        required: [ addressLine1, postcode, ownershipPercentage, version ]
-        properties:
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          propertyName:
-            type: [ string, 'null' ]
-            maxLength: 200
-          addressLine1:
-            type: string
-            maxLength: 200
-          addressLine2:
-            type: [ string, 'null' ]
-            maxLength: 200
-          town:
-            type: [ string, 'null' ]
-            maxLength: 100
-          county:
-            type: [ string, 'null' ]
-            maxLength: 100
-          postcode:
-            type: string
-            maxLength: 12
-          propertyType:
-            anyOf:
-              - $ref: '#/components/schemas/PropertyType'
-              - type: 'null'
-          purchaseDate:
-            type: [ string, 'null' ]
-            format: date
-          purchasePrice:
-            $ref: '#/components/schemas/NullableMoney'
-          ownershipPercentage:
-            type: number
-            exclusiveMinimum: 0
-            maximum: 100
-          notes:
-            type: [ string, 'null' ]
+      type: object
+      additionalProperties: false
+      description: |
+        Full update. Required fields must not be null.
+        Omission or explicit null for optional fields clears their stored value.
+      required: [ addressLine1, postcode, ownershipPercentage, version ]
+      properties:
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        propertyName:
+          type: [ string, 'null' ]
+          maxLength: 200
+        addressLine1:
+          type: string
+          maxLength: 200
+        addressLine2:
+          type: [ string, 'null' ]
+          maxLength: 200
+        town:
+          type: [ string, 'null' ]
+          maxLength: 100
+        county:
+          type: [ string, 'null' ]
+          maxLength: 100
+        postcode:
+          type: string
+          maxLength: 12
+        propertyType:
+          anyOf:
+            - $ref: '#/components/schemas/PropertyType'
+            - type: 'null'
+        purchaseDate:
+          type: [ string, 'null' ]
+          format: date
+        purchasePrice:
+          $ref: '#/components/schemas/NullableMoney'
+        ownershipPercentage:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+        notes:
+          type: [ string, 'null' ]
 
     PropertyResponse:
-        type: object
-        required: [ id, propertyReference, addressLine1, postcode, ownershipPercentage, active, version, createdAt, updatedAt ]
-        properties:
-          id:
-            type: string
-            format: uuid
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          propertyReference:
-            type: string
-          propertyName:
-            type: [ string, 'null' ]
-          addressLine1:
-            type: string
-          addressLine2:
-            type: [ string, 'null' ]
-          town:
-            type: [ string, 'null' ]
-          county:
-            type: [ string, 'null' ]
-          postcode:
-            type: string
-          propertyType:
-            anyOf:
-              - $ref: '#/components/schemas/PropertyType'
-              - type: 'null'
-          purchaseDate:
-            type: [ string, 'null' ]
-            format: date
-          purchasePrice:
-            $ref: '#/components/schemas/NullableMoney'
-          ownershipPercentage:
-            type: number
-          active:
-            type: boolean
-          notes:
-            type: [ string, 'null' ]
-          createdAt:
-            type: string
-            format: date-time
-          updatedAt:
-            type: string
-            format: date-time
+      type: object
+      required: [ id, propertyReference, addressLine1, postcode, ownershipPercentage, active, version, createdAt, updatedAt ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        propertyReference:
+          type: string
+        propertyName:
+          type: [ string, 'null' ]
+        addressLine1:
+          type: string
+        addressLine2:
+          type: [ string, 'null' ]
+        town:
+          type: [ string, 'null' ]
+        county:
+          type: [ string, 'null' ]
+        postcode:
+          type: string
+        propertyType:
+          anyOf:
+            - $ref: '#/components/schemas/PropertyType'
+            - type: 'null'
+        purchaseDate:
+          type: [ string, 'null' ]
+          format: date
+        purchasePrice:
+          $ref: '#/components/schemas/NullableMoney'
+        ownershipPercentage:
+          type: number
+        active:
+          type: boolean
+        notes:
+          type: [ string, 'null' ]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
     PageOfProperty:
       type: object
       required: [ content, totalElements, totalPages, page, size ]
@@ -926,85 +846,85 @@ components:
           type: [ string, 'null' ]
 
     TenancyUpdateInput:
-        type: object
-        additionalProperties: false
-        description: |
-          Full update. Required fields must not be null.
-          Omission or explicit null for optional fields clears their stored value.
-          Status transitions are strictly validated.
-        required: [ startDate, monthlyRent, status, version ]
-        properties:
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          startDate:
-            type: string
-            format: date
-          endDate:
-            type: [ string, 'null' ]
-            format: date
-          monthlyRent:
-            $ref: '#/components/schemas/Money'
-          paymentDay:
-            type: [ integer, 'null' ]
-            minimum: 1
-            maximum: 31
-          depositAmount:
-            $ref: '#/components/schemas/NullableMoney'
-          depositScheme:
-            type: [ string, 'null' ]
-            maxLength: 150
-          depositReference:
-            type: [ string, 'null' ]
-            maxLength: 150
-          status:
-            $ref: '#/components/schemas/TenancyStatus'
-          agreementDocumentId:
-            type: [ string, 'null' ]
-            format: uuid
-          notes:
-            type: [ string, 'null' ]
+      type: object
+      additionalProperties: false
+      description: |
+        Full update. Required fields must not be null.
+        Omission or explicit null for optional fields clears their stored value.
+        Status transitions are strictly validated.
+      required: [ startDate, monthlyRent, status, version ]
+      properties:
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: [ string, 'null' ]
+          format: date
+        monthlyRent:
+          $ref: '#/components/schemas/Money'
+        paymentDay:
+          type: [ integer, 'null' ]
+          minimum: 1
+          maximum: 31
+        depositAmount:
+          $ref: '#/components/schemas/NullableMoney'
+        depositScheme:
+          type: [ string, 'null' ]
+          maxLength: 150
+        depositReference:
+          type: [ string, 'null' ]
+          maxLength: 150
+        status:
+          $ref: '#/components/schemas/TenancyStatus'
+        agreementDocumentId:
+          type: [ string, 'null' ]
+          format: uuid
+        notes:
+          type: [ string, 'null' ]
 
     TenancyResponse:
-        type: object
-        required: [ id, propertyId, startDate, monthlyRent, status, version, createdAt, updatedAt ]
-        properties:
-          id:
-            type: string
-            format: uuid
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          propertyId:
-            type: string
-            format: uuid
-          startDate:
-            type: string
-            format: date
-          endDate:
-            type: [ string, 'null' ]
-            format: date
-          monthlyRent:
-            $ref: '#/components/schemas/Money'
-          paymentDay:
-            type: [ integer, 'null' ]
-          depositAmount:
-            $ref: '#/components/schemas/NullableMoney'
-          depositScheme:
-            type: [ string, 'null' ]
-          depositReference:
-            type: [ string, 'null' ]
-          status:
-            $ref: '#/components/schemas/TenancyStatus'
-          agreementDocumentId:
-            type: [ string, 'null' ]
-            format: uuid
-          notes:
-            type: [ string, 'null' ]
-          createdAt:
-            type: string
-            format: date-time
-          updatedAt:
-            type: string
-            format: date-time
+      type: object
+      required: [ id, propertyId, startDate, monthlyRent, status, version, createdAt, updatedAt ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        propertyId:
+          type: string
+          format: uuid
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: [ string, 'null' ]
+          format: date
+        monthlyRent:
+          $ref: '#/components/schemas/Money'
+        paymentDay:
+          type: [ integer, 'null' ]
+        depositAmount:
+          $ref: '#/components/schemas/NullableMoney'
+        depositScheme:
+          type: [ string, 'null' ]
+        depositReference:
+          type: [ string, 'null' ]
+        status:
+          $ref: '#/components/schemas/TenancyStatus'
+        agreementDocumentId:
+          type: [ string, 'null' ]
+          format: uuid
+        notes:
+          type: [ string, 'null' ]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
     PageOfTenancy:
       type: object
       required: [ content, totalElements, totalPages, page, size ]
@@ -1053,77 +973,77 @@ components:
           type: [ string, 'null' ]
 
     TenantUpdateInput:
-        type: object
-        additionalProperties: false
-        description: |
-          Full update. Required fields must not be null.
-          Omission or explicit null for optional fields clears their stored value.
-        required: [ fullName, version ]
-        properties:
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          fullName:
-            type: string
-            maxLength: 200
-          email:
-            type: [ string, 'null' ]
-            format: email
-            maxLength: 320
-          phone:
-            type: [ string, 'null' ]
-            maxLength: 50
-          moveInDate:
-            type: [ string, 'null' ]
-            format: date
-          moveOutDate:
-            type: [ string, 'null' ]
-            format: date
-          emergencyContactName:
-            type: [ string, 'null' ]
-            maxLength: 200
-          emergencyContactPhone:
-            type: [ string, 'null' ]
-            maxLength: 50
-          notes:
-            type: [ string, 'null' ]
+      type: object
+      additionalProperties: false
+      description: |
+        Full update. Required fields must not be null.
+        Omission or explicit null for optional fields clears their stored value.
+      required: [ fullName, version ]
+      properties:
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        fullName:
+          type: string
+          maxLength: 200
+        email:
+          type: [ string, 'null' ]
+          format: email
+          maxLength: 320
+        phone:
+          type: [ string, 'null' ]
+          maxLength: 50
+        moveInDate:
+          type: [ string, 'null' ]
+          format: date
+        moveOutDate:
+          type: [ string, 'null' ]
+          format: date
+        emergencyContactName:
+          type: [ string, 'null' ]
+          maxLength: 200
+        emergencyContactPhone:
+          type: [ string, 'null' ]
+          maxLength: 50
+        notes:
+          type: [ string, 'null' ]
 
     TenantResponse:
-        type: object
-        required: [ id, tenancyId, fullName, version, createdAt, updatedAt ]
-        properties:
-          id:
-            type: string
-            format: uuid
-          version:
-            $ref: '#/components/schemas/ResourceVersion'
-          tenancyId:
-            type: string
-            format: uuid
-          fullName:
-            type: string
-          email:
-            type: [ string, 'null' ]
-            format: email
-          phone:
-            type: [ string, 'null' ]
-          moveInDate:
-            type: [ string, 'null' ]
-            format: date
-          moveOutDate:
-            type: [ string, 'null' ]
-            format: date
-          emergencyContactName:
-            type: [ string, 'null' ]
-          emergencyContactPhone:
-            type: [ string, 'null' ]
-          notes:
-            type: [ string, 'null' ]
-          createdAt:
-            type: string
-            format: date-time
-          updatedAt:
-            type: string
-            format: date-time
+      type: object
+      required: [ id, tenancyId, fullName, version, createdAt, updatedAt ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          $ref: '#/components/schemas/ResourceVersion'
+        tenancyId:
+          type: string
+          format: uuid
+        fullName:
+          type: string
+        email:
+          type: [ string, 'null' ]
+          format: email
+        phone:
+          type: [ string, 'null' ]
+        moveInDate:
+          type: [ string, 'null' ]
+          format: date
+        moveOutDate:
+          type: [ string, 'null' ]
+          format: date
+        emergencyContactName:
+          type: [ string, 'null' ]
+        emergencyContactPhone:
+          type: [ string, 'null' ]
+        notes:
+          type: [ string, 'null' ]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
     PageOfTenant:
       type: object
       required: [ content, totalElements, totalPages, page, size ]
